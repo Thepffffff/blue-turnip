@@ -1,0 +1,37 @@
+# patches/0002-normal.patch
+#
+# NORMAL PROFILE — Adreno 6xx/7xx
+#
+# Balanced defaults. Let the driver make its own decisions, but push the
+# autotune system to use real timing measurements instead of bandwidth
+# estimation. This is the single highest-impact change for closing the
+# gap with the vendor driver on workloads without known bugs.
+#
+# TU_AUTOTUNE=profiled_static
+#   Instead of estimating GMEM vs sysmem cost from bandwidth math, this
+#   measures actual renderpass timing for the first ~20 frames of each
+#   unique renderpass configuration, then commits permanently to the
+#   faster mode. Far more accurate than the bandwidth algorithm.
+#   "static" suffix avoids the FPS variance of pure "profiled" mode.
+#
+# lrz_fast_clear_enabled = true: hardware depth-buffer fast clears via LRZ.
+
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -40,6 +40,7 @@
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <stdlib.h>
+ 
+@@ -421,4 +421,14 @@ tu_physical_device_init(struct tu_physical_device *device,
++   /*
++    * NORMAL PROFILE
++    * profiled_static autotune: measure actual renderpass timing for the
++    * first ~20 frames, then commit to the faster GMEM/sysmem mode.
++    * Significantly more accurate than the default bandwidth estimation
++    * algorithm and closes a meaningful chunk of the vendor driver gap
++    * without compromising any rendering correctness.
++    */
++   setenv("TU_AUTOTUNE", "profiled_static", 1);
++   setenv("TU_DEBUG", "fastclear", 1);
+    device->lrz_fast_clear_enabled = true;

@@ -1,0 +1,35 @@
+# patches/0005-disable-workgroup-explicit-layout.patch
+#
+# CRASH FIX — VK_KHR_workgroup_memory_explicit_layout (non-MC games)
+#
+# This driver targets ALL games, not just Minecraft Java Edition.
+# VK_KHR_workgroup_memory_explicit_layout is advertised by Turnip but its
+# ir3 SPIR-V handling for the Workgroup storage-class block decoration path
+# is broken on the KGSL Android kernel path, causing a null dereference in
+# the shader compiler when apps that enumerate this extension (emulators,
+# compute-heavy games, VulkanMod variants that use compute) attempt to
+# use it.
+#
+# Community builds that ship this: Weab-chan/freedreno_turnip-CI,
+# MrPurple666/purple-turnip, Bixbr/rando-turnip.
+#
+# Remove when upstream Mesa fixes ir3 workgroup block decoration on KGSL.
+# Track: https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/28254
+
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -810,6 +810,14 @@ tu_get_extensions(const struct tu_physical_device *device,
+                   struct vk_device_extension_table *exts)
+ {
+    *exts = (struct vk_device_extension_table) { false, };
++
++   /*
++    * BLUE TURNIP: Disable VK_KHR_workgroup_memory_explicit_layout.
++    * ir3's SPIR-V workgroup block decoration path is broken on KGSL
++    * Android, causing a shader-compiler null dereference when apps
++    * enable this extension and use Workgroup storage-class blocks.
++    * Affects emulators and compute-heavy games, not just Minecraft.
++    */
++   exts->KHR_workgroup_memory_explicit_layout = false;
++
+    #include "tu_extensions.h"

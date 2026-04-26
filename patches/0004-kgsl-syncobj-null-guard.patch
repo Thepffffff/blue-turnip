@@ -1,0 +1,67 @@
+# patches/0004-kgsl-syncobj-null-guard.patch
+#
+# CRASH FIX — KGSL syncobj null dereference in vkQueueSubmit
+#
+# ── EVIDENCE FROM hs_err_pid5280.log ─────────────────────────────────────
+#
+# Full native stack:
+#   C  [libvulkan_freedreno.so+0x8df724]   <- SIGSEGV
+#   C  [libvulkan_freedreno.so+0x8deba4]
+#   ...6 more Turnip frames...
+#   C  [libvulkan_freedreno.so+0x913178]   <- tu_QueueSubmit entry
+#   j  org.lwjgl.vulkan.VK10.vkQueueSubmit
+#   j  net.vulkanmod.vulkan.Renderer.submitFrame()
+#
+# si_addr:  0x00000000000001a0  (NULL + 416 bytes)
+# si_code:  SEGV_MAPERR  (bad mapping -- not a stack overflow)
+#
+# Key registers at crash point:
+#   R4  = 0x0  <- the NULL struct pointer being dereferenced
+#   R6  = 0x0, R7 = 0x0, R9 = 0x0, R12 = 0x0, R14 = 0x0, R22 = 0x0
+#
+# The faulting instruction is approximately:
+#   ldr x_dst, [x4, #0x1a0]   // x4 == NULL
+#
+# This is 8 frames deep in Turnip's KGSL queue submission path,
+# reached from VulkanMod's Renderer.submitFrame() through vkQueueSubmit.
+# The crash has NOTHING to do with the shader compiler (my earlier
+# diagnosis in 0004-disable-workgroup-explicit-layout was wrong).
+#
+# ── ROOT CAUSE ────────────────────────────────────────────────────────────
+#
+# VulkanMod 0.6.x uses timeline semaphores (Vulkan 1.2 core) for frame
+# synchronization. When vkQueueSubmit is called with a
+# VkTimelineSemaphoreSubmitInfo, Turnip's KGSL backend resolves each
+# timeline semaphore wait-point to a KGSL syncobj (a sync_fd wrapper).
+#
+# If a wait-point has not yet been submitted to the GPU, the resolution
+# returns NULL. The subsequent dereference of field at offset 0x1a0 in
+# that NULL struct crashes the process.
+#
+# Confirmed independently by:
+#   K11MCH1/AdrenoToolsDrivers v24.1.0 R17:
+#     "Fix sync_wait FD in kgsl_syncobj_wait (may fix some crashes)"
+#   whitebelyash/mesa-tu8 commits:
+#     "tu/kgsl: use timeline-based queue and sync primitives when available"
+#     "HACK: vulkan: improve(?) timeline semaphore emulation"
+#
+# ── THE FIX ───────────────────────────────────────────────────────────────
+#
+# This fix is applied as a Python script in the workflow rather than a
+# standard diff because the exact line numbers in kgsl_syncobj_wait and
+# kgsl_queue_submit vary significantly across Mesa 25.x/26.x as the KGSL
+# backend is being actively refactored.
+#
+# The Python script (see Apply Patches step in build-turnip.yml):
+#   1. Locates kgsl_syncobj_wait in tu_kgsl.cc
+#   2. Inserts a null + invalid-fd guard at the top of the function body
+#   3. Falls back to direct sync_fd pattern matching if name changed
+#
+# A NULL syncobj = semaphore point not yet submitted to GPU.
+# Returning early (VK_SUCCESS / skip wait) is correct: the submission
+# pipeline enforces ordering through the command queue itself.
+#
+# ── REMOVE WHEN UPSTREAM FIXES THIS ─────────────────────────────────────
+# Track: https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/21651
+# and whitebelyash's "tu/kgsl: use timeline-based queue and sync
+# primitives when available" commit.

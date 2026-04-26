@@ -1,0 +1,68 @@
+# patches/0002-low-gmem.patch
+#
+# LOW-GMEM PROFILE — Adreno 618, 630, and similar Adreno 6xx with small GMEM
+#
+# This profile fixes TWO distinct bugs on small-GMEM devices:
+#
+# BUG 1 — Half-screen rendering corruption (visual tiles, black regions)
+# ─────────────────────────────────────────────────────────────────────
+# Devices like the Adreno 618 have only 512 KB of GMEM. When a framebuffer
+# does not cleanly fit in that budget, the driver falls back mid-frame from
+# GMEM tiled rendering to sysmem (direct). The LRZ state machine writes
+# visibility data assuming the original tile layout; after the fallback that
+# data is stale, and the RB reads the wrong depth results, producing the
+# half-screen / quadrant corruption.
+#
+# Fix: TU_DEBUG=gmem forces tiled rendering for every renderpass, eliminating
+# the mid-frame fallback path.  TU_DEBUG=nolrz disables LRZ entirely so
+# there is no stale visibility data to corrupt output.
+#
+# BUG 2 — Partial texture loading (textures missing until resource reload)
+# ────────────────────────────────────────────────────────────────────────
+# On KGSL with the syncsource-based timeline semaphore emulation used on
+# kernel 4.14 devices (Snapdragon 720G / Adreno 618), staging buffer
+# pipeline barriers are sometimes not fully resolved before the next
+# submit's shaders sample the texture.  The GPU begins rendering a frame
+# before the CPU→GPU texture upload has been acknowledged, sampling
+# from un-uploaded memory and producing missing/corrupted textures.
+#
+# When the user forces a resource reload (toggle resource pack, change
+# setting), all assets are re-uploaded and re-synchronized from scratch,
+# which is why everything appears correct afterwards — the sync state
+# is reset.
+#
+# Fix: TU_DEBUG=flushall forces all pending GPU work to drain after every
+# queue submission. This eliminates the race between staging buffer
+# upload and shader sampling. The cost is reduced GPU pipelining, which
+# is acceptable on bandwidth-limited 618 hardware where pipelining
+# provides limited benefit anyway.
+#
+# Combined flag: gmem,nolrz,flushall
+#
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -40,6 +40,7 @@
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <stdlib.h>
+ 
+@@ -421,4 +422,22 @@ tu_physical_device_init(struct tu_physical_device *device,
++   /*
++    * LOW-GMEM PROFILE (Adreno 618 / 630 / small-GMEM 6xx)
++    *
++    * gmem     — force tiled rendering; prevents mid-frame sysmem fallback
++    *            that triggers the LRZ stale-data half-screen corruption.
++    * nolrz    — disable hierarchical depth; eliminates the stale visibility
++    *            data that causes half-screen rendering artefacts on 618/630.
++    * flushall — drain all pending GPU work after every submit; fixes the
++    *            staging buffer upload race that causes textures to appear
++    *            missing/partially loaded on first load but correct after
++    *            a forced resource reload. Essential on kernel 4.14 KGSL
++    *            where syncsource-based timeline emulation cannot guarantee
++    *            barrier ordering across submits.
++    *
++    * UBWC is left on; bandwidth compression is especially valuable on 618
++    * where memory bandwidth is the primary bottleneck.
++    */
++   setenv("TU_DEBUG", "gmem,nolrz,flushall", 1);
+    device->lrz_fast_clear_enabled = false;

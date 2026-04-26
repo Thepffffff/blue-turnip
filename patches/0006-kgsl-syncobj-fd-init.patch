@@ -1,0 +1,67 @@
+# patches/0006-kgsl-syncobj-fd-init.patch
+#
+# BUG FIX — KGSL syncobj fd not initialised to -1
+#
+# ── EVIDENCE FROM hs_err_pid5280.log ────────────────────────────────────
+#
+# R23 = 0x0000007249118110 → readable memory containing:
+#   0x0000000000000000 | 00 00 00 00 00 00 00 00
+#
+# This is a second, distinct issue from the NULL-pointer crash fixed in
+# 0004. R23 points to valid (non-null) memory, but that memory is all
+# zeros. This is a Turnip KGSL syncobj struct that was heap-allocated but
+# never had its fd field initialised.
+#
+# ── THE PROBLEM ──────────────────────────────────────────────────────────
+#
+# In Turnip's KGSL backend, syncobj (timeline emulation) structs have an
+# fd field that represents a sync_file fence fd:
+#   - fd == -1  means "not yet signalled / no fence"
+#   - fd >= 0   means "this is a valid sync_file fence fd"
+#
+# When a new syncobj is created (for a timeline semaphore that has never
+# been signalled), it should be initialised with fd = -1.
+#
+# However, when memory for the syncobj comes from a zero-initialised heap
+# allocation (which is the common case with calloc/new zeroing), the fd
+# field is 0, not -1.
+#
+# fd = 0 is VALID on Linux — it is stdin. Passing fd=0 to sync_wait()
+# will block waiting for stdin to become readable, which never happens
+# in a Vulkan game. The result is a GPU stall / hang that manifests as
+# the game appearing to freeze after the first few frames, even if the
+# NULL-pointer crash from 0004 is fixed first.
+#
+# ── WHY THIS MATTERS FOR ADRENO 618 / KERNEL 4.14 ───────────────────────
+#
+# The crash log was produced on an SM-A725F (Galaxy A72) running:
+#   Hardware: Qualcomm Technologies, Inc ATOLL-AB  (= Snapdragon 720G)
+#   Kernel:   4.14.190-perf-28694960-abA725FXXSBFYC1
+#   GPU:      Adreno 618
+#
+# Kernel 4.14 has KGSL_SYNCSOURCE ioctls (nr=0x33) but NOT the newer
+# KGSL timeline semaphore ioctls (0x55/0x56/0x57). Turnip therefore uses
+# syncsource-based timeline emulation for ALL timeline semaphore operations
+# on this device. Every timeline semaphore that has never been signalled
+# goes through this emulation path, making the fd-initialisation bug
+# appear on every single first-frame submit.
+#
+# ── THE FIX ──────────────────────────────────────────────────────────────
+#
+# This is applied as a Python script in the workflow (see build-turnip.yml)
+# because the exact struct layout and constructor location vary between
+# Mesa 25.x and 26.x. The script:
+#
+#   1. Finds the kgsl_syncobj initialisation / constructor in tu_kgsl.cc
+#   2. Ensures the fd field is set to -1, not left as 0
+#   3. Falls back to patching kgsl_syncobj_create if constructor not found
+#
+# An alternative simpler approach also included: patch kgsl_syncobj_wait
+# to treat fd==0 as invalid (return VK_SUCCESS early) in addition to
+# fd==-1. This is belt-and-suspenders alongside 0004's null guard.
+#
+# ── REMOVE WHEN ─────────────────────────────────────────────────────────
+#
+# Remove once upstream Turnip KGSL ensures syncobj fd is initialised to
+# -1 everywhere, or when whitebelyash's "tu/kgsl: use timeline-based queue
+# and sync primitives" is upstreamed and the emulation path is replaced.

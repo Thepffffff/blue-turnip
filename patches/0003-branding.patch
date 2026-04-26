@@ -1,0 +1,80 @@
+# patches/0003-branding.patch
+#
+# BLUE TURNIP BRANDING PATCH
+#
+# Changes the strings the driver reports through the Vulkan API to identify
+# itself as "Blue Turnip" and include both the Mesa and Vulkan versions.
+#
+# Fields affected (all readable via vkGetPhysicalDeviceProperties2 with
+# VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES):
+#
+#   driverName   VkPhysicalDeviceDriverProperties.driverName
+#                Shown in tools like GPU-Z, RenderDoc, and Vulkan Caps Viewer.
+#                Changed from "turnip" to "Blue Turnip".
+#
+#   driverInfo   VkPhysicalDeviceDriverProperties.driverInfo
+#                Free-form build string.  Changed from "Mesa X.Y.Z <sha>"
+#                to "Blue Turnip Mesa X.Y.Z Vulkan A.B.C" so both versions
+#                are visible at a glance without a separate query.
+#
+# The Vulkan version string is derived from VK_HEADER_VERSION_COMPLETE which
+# is defined in the Vulkan-Headers we copied in the workflow, guaranteeing it
+# always reflects the version we actually compiled against regardless of what
+# was hardcoded in the Mesa source.
+#
+# VkPhysicalDeviceProperties.deviceName is intentionally NOT changed — it
+# contains the GPU marketing name (e.g. "Adreno (TM) 650") and some apps
+# do substring matching on it for device-specific workarounds.
+#
+# Applies to: src/freedreno/vulkan/tu_device.cc
+# Mesa 25.x / 26.x  (function name tu_GetPhysicalDeviceProperties2 or the
+# newer vk_common path via tu_physical_device_get_properties).
+# If the hunk offset is wrong for your Mesa version, adjust the context lines
+# around the driverName / driverInfo snprintf calls.
+
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -40,6 +40,7 @@
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <stdio.h>
+
+@@ -800,12 +800,26 @@ tu_GetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice,
+          VkPhysicalDeviceDriverProperties *driver_props =
+             (VkPhysicalDeviceDriverProperties *) ext;
+ 
+          driver_props->driverID = VK_DRIVER_ID_MESA_TURNIP;
+ 
+-         memset(driver_props->driverName, 0, sizeof(driver_props->driverName));
+-         snprintf(driver_props->driverName,
+-                  sizeof(driver_props->driverName), "turnip");
+-
+-         memset(driver_props->driverInfo, 0, sizeof(driver_props->driverInfo));
+-         snprintf(driver_props->driverInfo,
+-                  sizeof(driver_props->driverInfo),
+-                  "Mesa " PACKAGE_VERSION MESA_GIT_SHA1);
++         /*
++          * BLUE TURNIP BRANDING
++          *
++          * driverName — "Blue Turnip" identifies this custom build in
++          *   diagnostic tools, RenderDoc captures, and crash reports.
++          *
++          * driverInfo — includes both Mesa and Vulkan versions so the full
++          *   build provenance is visible without a separate header query.
++          *   VK_HEADER_VERSION_COMPLETE is defined in vulkan_core.h from
++          *   the Vulkan-Headers we injected in the build workflow, so this
++          *   always reflects the exact API version we compiled against.
++          */
++         memset(driver_props->driverName, 0, sizeof(driver_props->driverName));
++         snprintf(driver_props->driverName,
++                  sizeof(driver_props->driverName),
++                  "Blue Turnip");
++
++         memset(driver_props->driverInfo, 0, sizeof(driver_props->driverInfo));
++         snprintf(driver_props->driverInfo,
++                  sizeof(driver_props->driverInfo),
++                  "Blue Turnip Mesa " PACKAGE_VERSION
++                  " Vulkan %u.%u.%u",
++                  VK_API_VERSION_MAJOR(VK_HEADER_VERSION_COMPLETE),
++                  VK_API_VERSION_MINOR(VK_HEADER_VERSION_COMPLETE),
++                  VK_API_VERSION_PATCH(VK_HEADER_VERSION_COMPLETE));
