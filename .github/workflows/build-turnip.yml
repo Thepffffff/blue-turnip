@@ -173,335 +173,69 @@ jobs:
       - name: Apply Patches
         run: |
           cd mesa
+
           apply() {
             local f="../patches/$1"
             if [ -f "$f" ]; then
-              git apply "$f" \
-                && echo "  OK   : $1" \
-                || echo "  WARN : $1 did not apply cleanly — check offsets against ${{ steps.ver.outputs.mesa_ver }}"
+              git apply "$f"                 && echo "  OK   : $1"                 || echo "  WARN : $1 did not apply cleanly"
             else
               echo "  SKIP : $f not found"
             fi
           }
+
+          pyfix() {
+            local f="../patches/$1"
+            if [ -f "$f" ]; then
+              python3 "$f"                 && echo "  OK   : $1"                 || echo "  WARN : $1 reported a problem"
+            else
+              echo "  SKIP : $f not found"
+            fi
+          }
+
+          # ── Git-format patches ────────────────────────────────────────
+          # 0001: Android standalone build stubs (property API + extension whitelist)
           apply "0001-android-stub.patch"
+
+          # 0002: Profile-specific rendering flags (per matrix.profile)
           apply "0002-${{ matrix.profile }}.patch"
-          # Branding: makes driverName="Blue Turnip" and driverInfo include
-          # both Mesa and Vulkan version strings visible in diagnostic tools.
+
+          # 0003: Blue Turnip branding in driverName + driverInfo
           apply "0003-branding.patch"
-          # VulkanMod crash fix: KGSL syncobj null guard.
-          # The hs_err log proves the SIGSEGV at +0x8df724 is in vkQueueSubmit
-          # (Renderer.submitFrame -> tu_QueueSubmit -> kgsl_syncobj_wait),
-          # NOT the shader compiler. A NULL syncobj at offset 0x1a0 crashes
-          # when Turnip tries to read the fd from an uninitialised timeline
-          # semaphore wait-point. Applied as a Python script because exact
-          # line numbers shift between Mesa 25.x and 26.x.
-          cd "$GITHUB_WORKSPACE/mesa"
-          python3 - << 'PYEOF'
-import re, sys
-
-path = "src/freedreno/vulkan/tu_kgsl.cc"
-try:
-    src = open(path).read()
-except FileNotFoundError:
-    print(f"SKIP: {path} not found (may be .c in older Mesa)")
-    sys.exit(0)
-
-GUARD = '''
-   /* BLUE TURNIP FIX: null guard for uninitialised KGSL syncobj.
-    * hs_err_pid crash analysis: si_addr=0x1a0 (NULL+416), R4=0x0.
-    * A timeline semaphore wait-point that was never submitted returns
-    * NULL from kgsl timeline resolution. Skip the sync_wait; the GPU
-    * submission pipeline enforces ordering through the command queue.
-    * Root cause confirmed: K11MCH1 R17 "Fix sync_wait FD in kgsl_syncobj_wait"
-    */
-   if (!sync || sync->fd < 0)
-      return VK_SUCCESS;
-'''
-
-# Try inserting after the opening brace of kgsl_syncobj_wait
-pattern = r'(kgsl_syncobj_wait\s*\([^)]*\)\s*\{)'
-if re.search(pattern, src):
-    patched = re.sub(pattern, r'' + GUARD, src, count=1)
-    open(path, 'w').write(patched)
-    print("OK: inserted null guard into kgsl_syncobj_wait")
-else:
-    # Fallback: guard the sync->fd dereference directly wherever it appears
-    # in a sync_wait context
-    pattern2 = r'(sync_wait\()(sync->fd)'
-    if re.search(pattern2, src):
-        patched = re.sub(
-            pattern2,
-            r'/* BLUE TURNIP: guard */ (sync && sync->fd >= 0) ? ',
-            src, count=1
-        )
-        open(path, 'w').write(patched)
-        print("OK: patched sync->fd access in sync_wait call (fallback)")
-    else:
-        print("WARN: could not locate kgsl_syncobj_wait or sync->fd pattern")
-        print("      Check tu_kgsl.cc manually for the syncobj wait path")
-PYEOF
-          cd "$GITHUB_WORKSPACE"
 
           # 0005: Disable VK_KHR_workgroup_memory_explicit_layout
-          # ir3 SPIR-V workgroup block path is broken on KGSL Android.
-          # Not just for Minecraft - affects emulators and compute games.
+          #       ir3 workgroup block path is broken on KGSL Android.
+          #       Affects emulators and compute-heavy games, not just MC.
           apply "0005-disable-workgroup-explicit-layout.patch"
 
-          # 0006: Initialise KGSL syncobj fd to -1 (not 0)
-          # R23 in the crash log points to all-zeroed syncobj memory.
-          # fd=0 is stdin - sync_wait(0,...) blocks forever = GPU hang.
-          # Applied via Python because struct layout shifts between Mesa versions.
-          cd "$GITHUB_WORKSPACE/mesa"
-          python3 - << 'PYEOF2'
-import re, sys
-
-path = "src/freedreno/vulkan/tu_kgsl.cc"
-try:
-    src = open(path).read()
-except FileNotFoundError:
-    print(f"SKIP: {path} not found"); sys.exit(0)
-
-FD_INIT = '''
-   /* BLUE TURNIP FIX: fd must be -1, not 0.
-    * fd=0 is stdin on Linux. sync_wait(0,...) blocks on stdin = GPU hang.
-    * Evidence: R23 in hs_err_pid5280 points to zero-filled syncobj struct.
-    * Zeroed memory leaves fd=0 which passes the >0 check but waits on stdin.
-    */
-   if (sync->fd == 0) sync->fd = -1;
-'''
-
-# Guard in kgsl_syncobj_wait: treat fd=0 same as fd=-1
-pattern_wait = r'(kgsl_syncobj_wait\s*\([^{]*\{)'
-if re.search(pattern_wait, src):
-    # Only add if not already patched
-    if 'fd == 0' not in src:
-        patched = re.sub(pattern_wait, r'' + FD_INIT, src, count=1)
-        open(path, 'w').write(patched)
-        print("OK: added fd=0 guard to kgsl_syncobj_wait")
-    else:
-        print("SKIP: fd=0 guard already present")
-else:
-    # Fallback: patch anywhere fd == -1 check to also include fd == 0
-    pattern_fd = r'(sync->fd\s*[<=>!]+\s*0)'
-    if re.search(pattern_fd, src):
-        patched = re.sub(
-            r'sync->fd\s*<\s*0',
-            '(sync->fd < 0 || sync->fd == 0 /* BLUE TURNIP: fd=0 is stdin, treat as invalid */)',
-            src
-        )
-        open(path, 'w').write(patched)
-        print("OK: patched fd<0 checks to also cover fd==0 (fallback)")
-    else:
-        print("WARN: could not locate sync->fd pattern for fd=0 guard")
-PYEOF2
-          cd "$GITHUB_WORKSPACE"
-
-          # 0007: High-quality driver improvements applied via Python.
-          # Covers: conformance version, stable pipeline cache UUID,
-          # and enabling fully-implemented extensions suppressed by the
-          # conservative Android whitelist.
-          cd "$GITHUB_WORKSPACE/mesa"
-          python3 - << 'PYEOF3'
-import re, sys, hashlib
-
-path = "src/freedreno/vulkan/tu_device.cc"
-try:
-    src = open(path).read()
-except FileNotFoundError:
-    print(f"SKIP: {path} not found"); sys.exit(0)
-
-changes = []
-
-# ── 1. Pipeline cache UUID: stable hash of Mesa + VK version ────────────
-# Without this Turnip generates a random UUID each session meaning
-# compiled pipelines are never reused between app launches.
-UUID_CODE = '''
-   /* BLUE TURNIP: stable pipeline cache UUID.
-    * Hash of PACKAGE_VERSION + VK_HEADER_VERSION_COMPLETE so the cache
-    * is valid across sessions but invalidated when the driver updates.
-    */
-   {
-      uint32_t vh = 0;
-      const char *v = PACKAGE_VERSION;
-      while (*v) vh = vh * 31 + (unsigned char)*v++;
-      vh ^= (uint32_t)VK_HEADER_VERSION_COMPLETE;
-      uint8_t *uuid = device->vk.properties.pipelineCacheUUID;
-      for (int i = 0; i < 4; i++)
-         uuid[i] = (vh >> (i * 8)) & 0xFF;
-      /* remaining bytes set to version magic for readability in captures */
-      uuid[4] = 'B'; uuid[5] = 'T'; uuid[6] = 'U'; uuid[7] = 'R';
-      uuid[8] = 'N'; uuid[9] = 'I'; uuid[10] = 'P'; uuid[11] = 0;
-   }
-'''
-
-# ── 2. Conformance version: report last known passing version ────────────
-# Turnip defaults to 0.0.0.0 which causes validation layers and some
-# game engines to apply bug workarounds or refuse to run.
-CONFORM_CODE = '''
-   /* BLUE TURNIP: set conformance version.
-    * 0.0.0.0 causes some engines/layers to apply workarounds or refuse to
-    * run. Report 1.3.0.0 which is the last known passing version for Turnip.
-    */
-   device->vk.properties.conformanceVersion = (VkConformanceVersion){
-      .major = 1, .minor = 3, .subminor = 0, .patch = 0 };
-'''
-
-# Find tu_physical_device_init and insert after first { of function body
-pattern = r'(tu_physical_device_init\s*\([^{]*\{)'
-if re.search(pattern, src):
-    if 'pipelineCacheUUID' not in src or 'BLUE TURNIP: stable' not in src:
-        src = re.sub(pattern, r'\1' + UUID_CODE + CONFORM_CODE, src, count=1)
-        changes.append("pipeline cache UUID + conformance version")
-else:
-    print("WARN: could not locate tu_physical_device_init for quality patches")
-
-open(path, 'w').write(src)
-
-# ── 3. Enable quality extensions in tu_device.cc get_extensions ─────────
-# These are fully implemented in Turnip but suppressed by the Android build.
-# 0001-android-stub opened the whitelist; now we explicitly ensure they're on.
-QUALITY_EXTS = [
-    ('KHR_shader_float16_int8',
-     '10-20% shader speedup via native fp16 units on Adreno 6xx/7xx'),
-    ('EXT_shader_demote_to_helper_invocation',
-     'correct derivative behaviour with discard; fixes post-processing artefacts'),
-    ('EXT_memory_budget',
-     'lets apps query available VRAM and scale quality accordingly'),
-    ('EXT_memory_priority',
-     'kernel evicts low-priority resources first; reduces mid-session OOM'),
-    ('EXT_pipeline_creation_cache_control',
-     'non-blocking pipeline compilation; reduces hitching on shader load'),
-    ('KHR_pipeline_executable_properties',
-     'exposes compiled shader stats to profiling tools'),
-]
-
-src = open(path).read()
-inserted = []
-for ext, reason in QUALITY_EXTS:
-    field = f'exts->{ext}'
-    if field not in src:
-        # Find tu_get_extensions or equivalent and append before the #include
-        if 'tu_extensions.h' in src and field not in src:
-            src = src.replace(
-                '#include "tu_extensions.h"',
-                f'   exts->{ext} = true; /* BLUE TURNIP: {reason} */\n'
-                '#include "tu_extensions.h"'
-            )
-            inserted.append(ext)
-
-open(path, 'w').write(src)
-if inserted:
-    changes.append(f"enabled extensions: {', '.join(inserted)}")
-
-if changes:
-    print("OK: quality improvements applied:", '; '.join(changes))
-else:
-    print("INFO: quality patches already present or patterns not matched")
-PYEOF3
-          cd "$GITHUB_WORKSPACE"
-
-          # 0008: Performance gap mitigation.
-          # Apply env vars for texture prefetch + shader precompile in source,
-          # and enable fp16/mediump lowering in the ir3 compiler options.
+          # 0008: Performance gap — env vars for texture prefetch + precompile
           apply "0008-performance-gap.patch"
 
-          # fp16 mediump lowering — applied via Python (line numbers vary).
-          # Adreno 6xx/7xx fp16 ALUs run at 2x throughput. This ensures
-          # the NIR compiler pass that promotes mediump vars to fp16 storage
-          # is enabled, matching vendor driver behaviour on relaxedPrecision.
-          cd "$GITHUB_WORKSPACE/mesa"
-          python3 - << 'PYEOF4'
-import re, sys
+          # ── Python fixup scripts ──────────────────────────────────────
+          # These are .py files, not git diffs, because the target line
+          # numbers shift between Mesa 25.x and 26.x. Each script detects
+          # its own insertion point and is idempotent (safe to re-run).
 
-# Target: tu_shader.cc — where ir3 NIR compiler options are configured
-for path in ["src/freedreno/vulkan/tu_shader.cc", "src/freedreno/vulkan/tu_shader.c"]:
-    try:
-        src = open(path).read()
-        break
-    except FileNotFoundError:
-        src = None
+          # 0004: KGSL syncobj null guard in vkQueueSubmit path
+          #       Fixes SIGSEGV at +0x8df724 (NULL+0x1a0 dereference)
+          #       confirmed in hs_err_pid5280.log R4=0x0 crash chain.
+          pyfix "fix_kgsl_null_guard.py"
 
-if not src:
-    print("SKIP: tu_shader.cc not found"); sys.exit(0)
+          # 0006: KGSL syncobj fd=0 guard (fd=0 is stdin, causes GPU hang)
+          #       Upgrades the 0004 null guard to also cover fd=0.
+          #       Evidence: R23 -> all-zero heap page, fd field = 0.
+          pyfix "fix_kgsl_fd_init.py"
 
-if 'BLUE TURNIP: fp16' in src:
-    print("SKIP: fp16 patch already applied"); sys.exit(0)
+          # 0007: Quality driver improvements
+          #       Stable pipeline cache UUID, conformance version 1.3.0.0,
+          #       quality extensions (fp16, memory_budget, demote_to_helper)
+          pyfix "fix_quality_driver.py"
 
-FP16_COMMENT = "/* BLUE TURNIP: fp16 mediump lowering — 2x ALU throughput on Adreno 6xx/7xx */
-"
+          # 0008 (part 2): fp16/mediump lowering in ir3 compiler
+          #       Enables native fp16 ALU path for mediump-eligible ops.
+          #       Adreno 6xx/7xx fp16 units run at 2x fp32 throughput.
+          pyfix "fix_fp16_mediump.py"
 
-# Form 1: nir_shader_compiler_options options = {} initialisation block
-# Insert force_mediump_nir_types_mask and related fields
-options_init = r'(nir_shader_compiler_options\s+\w+\s*=\s*\{[^}]*\})'
-def add_fp16_to_options(m):
-    block = m.group(0)
-    # Add fp16 flags inside the options struct if not already present
-    if 'force_mediump_nir_types_mask' not in block:
-        # Insert before closing brace
-        block = block[:-1] + (
-            "
-   " + FP16_COMMENT.strip() +
-            "
-   .force_mediump_nir_types_mask = nir_type_float16,"
-            "
-   .lower_mediump_io = false, /* keep IO at fp32 for correctness */"
-            "
-}"
-        )
-    return block
 
-patched = re.sub(options_init, add_fp16_to_options, src, count=1, flags=re.DOTALL)
-
-# Form 2: ir3_compiler_options struct — set mediump flags
-compiler_opts = r'(struct\s+ir3_compiler_options\s+\w+\s*=\s*\{[^}]*\})'
-def add_fp16_to_ir3(m):
-    block = m.group(0)
-    if 'mediump' not in block:
-        block = block[:-1] + (
-            "
-   " + FP16_COMMENT.strip() +
-            "
-   .lower_mediump_var = true,"
-            "
-}"
-        )
-    return block
-
-patched = re.sub(compiler_opts, add_fp16_to_ir3, patched, count=1, flags=re.DOTALL)
-
-# Form 3: direct call to nir_lower_mediump_vars if not already present
-# The pass is called from tu_spirv_to_nir or the NIR optimization loop
-if 'nir_lower_mediump_vars' not in patched:
-    # Find the NIR optimization section (usually after nir_validate_shader)
-    nir_opt_pattern = r'(nir_validate_shader\s*\([^;]+;\s*
-)'
-    if re.search(nir_opt_pattern, patched):
-        MEDIUMP_PASS = (
-            "
-   /* BLUE TURNIP: fp16 mediump lowering */"
-            "
-   nir_lower_mediump_vars(nir, nir_var_function_temp | nir_var_mem_shared);"
-        )
-        patched = re.sub(nir_opt_pattern, r'\1' + MEDIUMP_PASS + '
-', patched, count=1)
-
-open(path, 'w').write(patched)
-print(f"OK: fp16/mediump lowering applied to {path}")
-print("    Adreno 6xx/7xx fp16 ALUs now used for mediump-eligible operations")
-PYEOF4
-          cd "$GITHUB_WORKSPACE"
-
-      # ──────────────────────────────────────────────────────────────────────
-      # CROSS COMPILATION SETUP
-      #
-      # API 33 (Android 13) is the minimum for full Vulkan 1.3 support at the
-      # Android platform level. All Adreno 6xx/7xx devices that matter run
-      # Android 10+ so this is safe.
-      #
-      # armv8-a+crypto+crc covers all Adreno 6xx (sd845–sd888) and 7xx (sd8g1+).
-      # crypto and crc are universally available on these SoCs and reduce the
-      # overhead of hash and cryptographic operations in shaders/pipelines.
-      # ──────────────────────────────────────────────────────────────────────
       - name: Write Cross File
         run: |
           TC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
