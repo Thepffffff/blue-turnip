@@ -1,0 +1,111 @@
+# patches/0001-android-stub.patch
+#
+# ANDROID STANDALONE STUB PATCH
+#
+# When building Turnip as a standalone ICD via -Dandroid-stub=true, the NDK
+# build environment does not link against a full Android system image, so
+# several libc/libandroid symbols that Mesa calls at runtime are absent at
+# link time.  This patch provides no-op stubs for those symbols, scoped
+# behind #if defined(ANDROID) so they never affect host builds.
+#
+# Symbols stubbed:
+#   __system_property_get          — read a system property by name
+#   __system_property_set          — write a system property (always fails)
+#   __system_property_find         — look up a prop_info handle by name
+#   __system_property_read_callback — read via callback (prop_info API v2)
+#
+# Return-type notes:
+#   __system_property_get          → int  (length of value string, or 0)
+#   __system_property_set          → int  (0 = success, -1 = error; we return -1
+#                                         because we never actually write anything)
+#   __system_property_find         → const void* / prop_info* (NULL = not found)
+#   __system_property_read_callback → void  (NOT int — earlier version was wrong)
+#
+# vk_extensions.py change:
+#   The original whitelist guard strips any extension whose name does not begin
+#   with a known Android-safe prefix (e.g. KHR_, EXT_).  For a standalone ICD
+#   that runs directly under a custom loader this whitelist is unnecessary and
+#   prevents vendor extensions from being advertised.
+#   We replace the guard with an unconditional 'true' so the generated C always
+#   compiles the extension dispatch stubs in, and Turnip's own feature-detection
+#   code remains the sole gatekeeper for whether an extension is actually exposed.
+
+# ── src/util/os_misc.c ────────────────────────────────────────────────────────
+--- a/src/util/os_misc.c
++++ b/src/util/os_misc.c
+@@ -37,6 +37,42 @@
+ #include <unistd.h>
++
++#if defined(ANDROID)
++/*
++ * Standalone NDK build stubs.
++ *
++ * These symbols are normally provided by libandroid / libc on a real Android
++ * system.  When building the driver as a self-contained ICD (android-stub=true)
++ * we are not linking against those system libraries, so we provide inert
++ * replacements.  Mesa only calls these when reading driver tunables from the
++ * Android property system; returning empty / not-found values is safe — the
++ * driver will simply use its compiled-in defaults.
++ *
++ * prop_info is an opaque handle type defined in <sys/system_properties.h>.
++ * We forward-declare it as an incomplete struct so the function signatures
++ * match without pulling in the full Android header, which may not be present
++ * in all NDK configurations.
++ */
++struct prop_info;
++
++/* Returns the length of the value written into 'value', or 0 if not found. */
++int __system_property_get(const char *name, char *value)
++{
++   (void)name;
++   if (value) value[0] = '\0';
++   return 0;
++}
++
++/* Returns 0 on success, -1 on failure.  We always fail — we cannot persist. */
++int __system_property_set(const char *name, const char *value)
++{
++   (void)name; (void)value;
++   return -1;
++}
++
++/* Returns a prop_info handle, or NULL if the property does not exist. */
++const struct prop_info *__system_property_find(const char *name)
++{
++   (void)name;
++   return NULL;
++}
++
++/*
++ * Calls 'callback' with the property's name, value, and serial number.
++ * Return type is void — matching the real Android ABI exactly.
++ * The earlier version of this stub incorrectly returned int, which would
++ * cause undefined behaviour on architectures where int != pointer size if
++ * the caller ever read a return value.
++ */
++void __system_property_read_callback(
++   const struct prop_info *pi,
++   void (*callback)(void *cookie, const char *name,
++                    const char *value, unsigned int serial),
++   void *cookie)
++{
++   (void)pi; (void)callback; (void)cookie;
++   /* no-op: property not found, callback is never invoked */
++}
++
++#endif /* ANDROID */
+
+# ── src/vulkan/util/vk_extensions.py ─────────────────────────────────────────
+--- a/src/vulkan/util/vk_extensions.py
++++ b/src/vulkan/util/vk_extensions.py
+@@ -50,9 +50,11 @@
+     def c_android_condition(self):
+-        if not self.name.startswith(ANDROID_EXTENSION_WHITELIST_PREFIXES):
+-            return 'false'
+-        return 'true'
++        # The upstream whitelist strips vendor/non-KHR extensions for Android
++        # system builds.  For a standalone ICD the loader is not the Android
++        # Vulkan runtime, so the whitelist serves no purpose.  We return 'true'
++        # unconditionally; Turnip's own feature-detection in tu_device.cc
++        # remains the sole gate for whether each extension is actually exposed.
++        return 'true'
